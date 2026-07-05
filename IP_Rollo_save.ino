@@ -21,7 +21,7 @@ const int PIN_HOCH = 23;          // Wandtaster OBEN (gegen GND)
 const int PIN_BOARD = 0;          // Board-Taste (Kalibrierung, gegen GND)
 
 const unsigned long TASTER_ENTPRELL_MS = 100;
-const unsigned long LS_ENTPRELL_MS = 15;
+const unsigned long LS_ENTPRELL_MS = 40;      // FIX: Erhöht von 15ms auf 40ms für zuverlässige Entprellung
 const unsigned long BOARD_ENTPRELL_MS = 50;
 const unsigned long RELAIS_OFF_DELAY_MS = 50;
 const unsigned long MOTOR_NACHLAUF_MS = 500;
@@ -44,6 +44,8 @@ KalibrierPhase kalibrierPhase = KALIBRIERUNG_IDLE;
 
 volatile long impulsZaehler = 0;            // Wird in ISR verändert -> atomar behandeln
 volatile unsigned long lsChangeZeit = 0;    // ms (ISR-sicher mit esp_timer_get_time())
+volatile long autoTargetPos = 0;            // FIX: volatile für ISR-Sicherheit
+volatile bool autoFahrtAktiv = false;       // FIX: volatile für ISR-Sicherheit
 
 long endpunktHoch = DEFAULT_HOCH;
 long endpunktRunter = DEFAULT_RUNTER;
@@ -79,10 +81,6 @@ bool eepromDirty = false;
 // Halboffen-Feature (persistiert)
 bool halbOffenEnabled = false; // persistent setting
 
-// Automatik-Zielposition (wenn Automatik fährt, wird dieses Ziel verwendet)
-long autoTargetPos = 0;
-bool autoFahrtAktiv = false;
-
 // Double-tap detection for HOCH
 unsigned long lastHochTapTime = 0;
 int hochTapCount = 0;
@@ -92,6 +90,10 @@ bool bootReferenzErforderlich = true; // Erzwingt einmalige Abwärtsfahrt nach d
 // WiFi credentials stored in preferences
 String storedSSID = "";
 String storedPASS = "";
+
+// WiFi connection state for non-blocking connection
+volatile bool wifiConnecting = false;
+unsigned long wifiConnectStart = 0;
 
 // Forward declarations
 bool lade_kalibrierung_aus_eeprom();
@@ -107,7 +109,8 @@ void starte_kalibrierung();
 void fahre_motor(MotorState richtung);
 void stoppe_motor();
 long getImpulsZaehlerSafe();
-void attemptConnectToWifi(boolean showSerial);
+void attemptConnectToWifiAsync(boolean showSerial);
+void verwalte_wifi_verbindung(unsigned long jetzt);
 
 // ============================================================================
 // Helper: atomisch sicheren Wert vom Impulszähler holen
@@ -118,6 +121,18 @@ long getImpulsZaehlerSafe() {
   v = impulsZaehler;
   interrupts();
   return v;
+}
+
+// ============================================================================
+// FIX: Helper: atomisch sicheren Motorstatus und Zielposition holen
+// ============================================================================
+void getMotorStatesSafe(long& pos, long& targetUp, long& targetDown, bool& active) {
+  noInterrupts();
+  pos = impulsZaehler;
+  targetUp = autoTargetPos;
+  targetDown = autoTargetPos;
+  active = autoFahrtAktiv;
+  interrupts();
 }
 
 // ============================================================================
@@ -150,7 +165,7 @@ void handleRoot() {
   html += "<style>body{font-family:Arial;text-align:center;background:#f4f4f4;margin:0;padding:20px;}";
   html += "h2{color:#333;margin-bottom:5px;} .btn{display:block;width:80%;max-width:320px;margin:10px auto;padding:14px;font-size:18px;color:white;border:none;border-radius:10px;cursor:pointer;}";
   html += ".btn-up{background:#4CAF50}.btn-down{background:#2196F3}.btn-stop{background:#f44336}.box{background:#fff;padding:12px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.08);max-width:360px;margin:10px auto;}";
-  html += ".small{font-size:13px;color:#666;margin-bottom:8px}.toggle-on{background:#4CAF50;padding:6px 10px;border-radius:6px;color:#fff}.toggle-off{background:#aaa;padding:6px 10px;border-radius:6px;color:#fff}";
+  html += ".small{font-size:13px;color:#666;margin-bottom:8px}.toggle-on{background:#4CAF50;padding:6px 10px;border-radius:6px;color:#fff}.toggle-off{background:#aaa;padding:6px 10px;border-radius:6px;color:#fff}input{width:90%;padding:8px;margin:5px 0;}";
   html += "</style>";
   html += "</head><body>";
 
@@ -231,6 +246,7 @@ void IRAM_ATTR lsInterruptISR() {
   if ((uint32_t)(jetzt - lsChangeZeit) > LS_ENTPRELL_MS) {
     lsChangeZeit = jetzt;
     if (motorState == MOTOR_UP) {
+      // FIX: Overflow-Schutz bei hochfahren
       if (systemState == STATE_KALIBRIERUNG || impulsZaehler < MAX_IMPULSE) impulsZaehler++;
     } else if (motorState == MOTOR_DOWN) {
       if (systemState == STATE_KALIBRIERUNG || systemState == STATE_BOOT) impulsZaehler--;
@@ -326,7 +342,7 @@ void setup() {
       preferences.end();
       Serial.println("[WIFI] Zugangsdaten gespeichert. Versuche Verbindung...");
       storedSSID = ssid; storedPASS = pass;
-      attemptConnectToWifi(true);
+      attemptConnectToWifiAsync(true);
     }
     server.sendHeader("Location", "/"); server.send(303);
   });
@@ -370,8 +386,8 @@ void setup() {
     Serial.println("[System] Kalibrierung geladen. Warte auf Referenzfahrt nach UNTEN...");
   }
 
-  // Try to connect to wifi stored credentials
-  if (storedSSID.length() > 0) attemptConnectToWifi(true);
+  // Try to connect to wifi stored credentials asynchronously
+  if (storedSSID.length() > 0) attemptConnectToWifiAsync(true);
 }
 
 // ============================================================================
@@ -383,6 +399,7 @@ void loop() {
   server.handleClient();
 
   verwalte_motor_nachlauf(jetzt);
+  verwalte_wifi_verbindung(jetzt);   // FIX: Non-blocking WiFi-Management
   if (systemState == STATE_NORMAL) verwalte_zeitschaltuhr();
   lese_sensoren(jetzt);
 
@@ -415,12 +432,19 @@ void verwalte_zeitschaltuhr() {
     if (halbOffenEnabled) {
       target = endpunktRunter + (endpunktHoch - endpunktRunter) / 2;
     } else target = endpunktHoch;
-    autoTargetPos = target; autoFahrtAktiv = true;
+    // FIX: Atomare Zuweisung mit noInterrupts()
+    noInterrupts();
+    autoTargetPos = target; 
+    autoFahrtAktiv = true;
+    interrupts();
     fahre_motor(MOTOR_UP);
     letzteMinute = m;
   }
   if (!zuGesperrt && h == zuStunde && m == zuMinute) {
-    autoTargetPos = endpunktRunter; autoFahrtAktiv = true;
+    noInterrupts();
+    autoTargetPos = endpunktRunter; 
+    autoFahrtAktiv = true;
+    interrupts();
     fahre_motor(MOTOR_DOWN);
     letzteMinute = m;
   }
@@ -442,53 +466,72 @@ void handle_normal_state(unsigned long jetzt) {
     return;
   } else if (tasterBoardAktuell == HIGH) boardTasteLetzterZustandNormal = HIGH;
 
-  // Sicherheits-Stopp bei Erreichen der Endpunkte oder autoTargetPos
-  long pos = getImpulsZaehlerSafe();
-  long targetUp = autoFahrtAktiv ? autoTargetPos : endpunktHoch;
+  // FIX: Sicherheits-Stopp bei Erreichen der Endpunkte oder autoTargetPos (mit Atomic Read)
+  long pos, targetUp, targetDown;
+  bool autoActive;
+  getMotorStatesSafe(pos, targetUp, targetDown, autoActive);
+  
   if (motorState == MOTOR_UP && pos >= targetUp) stoppe_motor();
-  long targetDown = autoFahrtAktiv ? autoTargetPos : endpunktRunter;
   if (motorState == MOTOR_DOWN && pos <= targetDown) stoppe_motor();
 
   // Taster/Web HOCH
   if (tasterHochGedrueckt || webHochGedrueckt) {
-    tasterHochGedrueckt = false; webHochGedrueckt = false;
-    // Double-tap detection (nur im Normalbetrieb)
-    unsigned long now = millis();
-    if (tasterHochGedrueckt) {}
-    if (now - lastHochTapTime <= DOUBLE_TAP_MS) {
-      hochTapCount++;
-    } else {
-      hochTapCount = 1;
-    }
-    lastHochTapTime = now;
+    // FIX: Variablenwert vor dem Reset speichern für Double-Tap-Logik
+    bool wasPressedHoch = tasterHochGedrueckt;
+    bool wasPressedWeb = webHochGedrueckt;
+    tasterHochGedrueckt = false; 
+    webHochGedrueckt = false;
+    
+    if (wasPressedHoch || wasPressedWeb) {  // Double-tap detection (nur im Normalbetrieb)
+      unsigned long now = millis();
+      if (now - lastHochTapTime <= DOUBLE_TAP_MS) {
+        hochTapCount++;
+      } else {
+        hochTapCount = 1;
+      }
+      lastHochTapTime = now;
 
-    if (hochTapCount == 2 && motorState == MOTOR_IDLE) {
-      // Doppeltipp -> halboffen (nur bei Normalbetrieb)
-      long half = endpunktRunter + (endpunktHoch - endpunktRunter) / 2;
-      autoTargetPos = half; autoFahrtAktiv = true;
-      Serial.println("[DOPPELT] HOCH-Doppeltipp: Fahre auf Halboffen");
-      fahre_motor(MOTOR_UP);
-      hochTapCount = 0;
-      return;
-    }
+      if (hochTapCount == 2 && motorState == MOTOR_IDLE) {
+        // Doppeltipp -> halboffen (nur bei Normalbetrieb)
+        long half = endpunktRunter + (endpunktHoch - endpunktRunter) / 2;
+        noInterrupts();
+        autoTargetPos = half; 
+        autoFahrtAktiv = true;
+        interrupts();
+        Serial.println("[DOPPELT] HOCH-Doppeltipp: Fahre auf Halboffen");
+        fahre_motor(MOTOR_UP);
+        hochTapCount = 0;
+        return;
+      }
 
-    // Normales Verhalten: wenn Motor läuft -> stoppe, sonst fahre hoch (voll)
-    if (motorState != MOTOR_IDLE) {
-      stoppe_motor();
-      autoFahrtAktiv = false;
-    } else {
-      autoFahrtAktiv = false;
-      if (pos < endpunktHoch) fahre_motor(MOTOR_UP);
+      // Normales Verhalten: wenn Motor läuft -> stoppe, sonst fahre hoch (voll)
+      if (motorState != MOTOR_IDLE) {
+        stoppe_motor();
+        noInterrupts();
+        autoFahrtAktiv = false;
+        interrupts();
+      } else {
+        noInterrupts();
+        autoFahrtAktiv = false;
+        interrupts();
+        if (pos < endpunktHoch) fahre_motor(MOTOR_UP);
+      }
     }
   }
 
   // Taster/Web RUNTER
   else if (tasterRunterGedrueckt || webRunterGedrueckt) {
-    tasterRunterGedrueckt = false; webRunterGedrueckt = false;
+    tasterRunterGedrueckt = false; 
+    webRunterGedrueckt = false;
     if (motorState != MOTOR_IDLE) {
-      stoppe_motor(); autoFahrtAktiv = false;
-    } else {
+      stoppe_motor(); 
+      noInterrupts();
       autoFahrtAktiv = false;
+      interrupts();
+    } else {
+      noInterrupts();
+      autoFahrtAktiv = false;
+      interrupts();
       if (pos > endpunktRunter) fahre_motor(MOTOR_DOWN);
     }
   }
@@ -594,9 +637,9 @@ void handle_boot_state() {
   static bool boardTasteLetzterZustandBoot = HIGH;
   static bool erststartSperre = true;
 
-  if (erststartSperre) { erststartSperre = false; tasterHochGedrueckt = false; tasterRunterGedrueckt = false; webHochGedrueckt = false; webRunterGedrueckt = false; stoppe_motor(); Serial.println("[System] Boot-Sicherheitsphase initialisiert."); return; }
+  if (erststartSperre) { erststartSperre = false; tasterHochGedrueckt = false; tasterRunterGedrueckt = false; webHochGedrueckt = false; webRunterGedrueckt = false; stoppe_motor(); Serial.println("[System] Boot-State aktiviert."); }
 
-  if (tasterBoardAktuell == LOW && boardTasteLetzterZustandBoot == HIGH) { boardTasteLetzterZustandBoot = LOW; Serial.println("[ERST] Board-Taste: Starte Kalibrierung"); bootReferenzErforderlich = false; starte_kalibrierung(); return; }
+  if (tasterBoardAktuell == LOW && boardTasteLetzterZustandBoot == HIGH) { boardTasteLetzterZustandBoot = LOW; Serial.println("[ERST] Board-Taste: Starte Kalibrierung"); bootReferenzErforderlich = false; starte_kalibrierung(); }
   else if (tasterBoardAktuell == HIGH) boardTasteLetzterZustandBoot = HIGH;
 
   webHochGedrueckt = false; webRunterGedrueckt = false;
@@ -608,7 +651,7 @@ void handle_boot_state() {
       if (motorState == MOTOR_DOWN) stoppe_motor(); else { fahre_motor(MOTOR_DOWN); fahrtAktiviert = true; }
     }
     if (fahrtAktiviert && motorState == MOTOR_IDLE) {
-      noInterrupts(); impulsZaehler = 0; interrupts(); bootReferenzErforderlich = false; systemState = STATE_NORMAL; fahrtAktiviert = false; Serial.println("[System] Referenzfahrt beendet. Normalbetrieb.");
+      noInterrupts(); impulsZaehler = 0; interrupts(); bootReferenzErforderlich = false; systemState = STATE_NORMAL; fahrtAktiviert = false; Serial.println("[System] Referenzfahrt beendet. Normalbetrieb gestartet.");
     }
   } else systemState = STATE_NORMAL;
 }
@@ -664,21 +707,26 @@ void debug_ausgabe() {
 }
 
 // ============================================================================
-// WiFi: Versuch STA-Verbindung
+// WiFi: Asynchrone (Non-Blocking) Verbindung
 // ============================================================================
-void attemptConnectToWifi(boolean showSerial) {
+void attemptConnectToWifiAsync(boolean showSerial) {
   if (storedSSID.length() == 0) return;
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(storedSSID.c_str(), storedPASS.c_str());
-  unsigned long start = millis();
+  wifiConnecting = true;
+  wifiConnectStart = millis();
   if (showSerial) Serial.print("[WIFI] Verbindung zu "); Serial.print(storedSSID);
-  while (millis() - start < 8000) {
-    if (WiFi.status() == WL_CONNECTED) break;
-    delay(200);
-  }
+}
+
+// FIX: Non-blocking WiFi management in main loop
+void verwalte_wifi_verbindung(unsigned long jetzt) {
+  if (!wifiConnecting) return;
+  
   if (WiFi.status() == WL_CONNECTED) {
-    if (showSerial) { Serial.print(" verbunden, IP= "); Serial.println(WiFi.localIP()); }
-  } else {
-    if (showSerial) Serial.println(" fehlgeschlagen (AP weiter verfügbar)");
+    Serial.print(" verbunden, IP= "); Serial.println(WiFi.localIP());
+    wifiConnecting = false;
+  } else if (jetzt - wifiConnectStart > 8000) {
+    Serial.println(" fehlgeschlagen (AP weiter verfügbar)");
+    wifiConnecting = false;
   }
 }
